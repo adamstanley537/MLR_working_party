@@ -335,7 +335,7 @@ def create_train_test_datasets(dat: pd.DataFrame, config: ExperimentConfig) -> T
         features + ["claim_no"]
     ]
     y_test = dat.loc[
-        (dat.train_ind_time == 1) & (dat.train_ind == 0) & (dat.train_settled == 0)
+        (dat.test_ind_time == 1) & (dat.train_ind == 0) & (dat.train_settled == 0)
     ].groupby('claim_no')[y_output].last()
     
     return trainx, y_train, testx, y_test
@@ -375,3 +375,75 @@ def create_train_test_datasets_davide(dat: pd.DataFrame, config: ExperimentConfi
     ].groupby('claim_no')[y_output].last()
     
     return trainx, y_train, testx, y_test
+
+def evaluate_claim_predictions(
+    prediction_data: pd.DataFrame,
+    predictions,
+    output_column: str,
+    paid_by_claim=None,
+    claim_column="claim_no",
+    payment_column="payment_size",
+    print_results=True,
+):
+    actual = prediction_data.groupby(claim_column)[output_column].last().sort_index().astype(float)
+    prediction = np.asarray(predictions).reshape(-1)
+    if len(prediction) != len(actual):
+        raise ValueError(f"Predictions ({len(prediction)}) do not match claims ({len(actual)}).")
+    predicted = pd.Series(prediction, index=actual.index, name="predicted_ultimate")
+
+    if paid_by_claim is None:
+        if "payment_size_cumulative" in prediction_data.columns:
+            paid = (
+                prediction_data.sort_values([claim_column, "development_period"])
+                .groupby(claim_column)["payment_size_cumulative"].last()
+            )
+        else:
+            paid = prediction_data.groupby(claim_column)[payment_column].sum()
+    else:
+        paid = pd.Series(paid_by_claim)
+    paid = pd.to_numeric(paid, errors="coerce").reindex(actual.index)
+    if paid.isna().any():
+        raise ValueError("Paid-to-date is missing for one or more claims.")
+
+    evaluation = pd.DataFrame({
+        "actual_ultimate": actual,
+        "predicted_ultimate": predicted,
+        "paid_to_date": paid,
+    })
+    evaluation["actual_reserve"] = evaluation["actual_ultimate"] - evaluation["paid_to_date"]
+    evaluation["predicted_reserve"] = evaluation["predicted_ultimate"] - evaluation["paid_to_date"]
+    evaluation["ultimate_error"] = evaluation["predicted_ultimate"] - evaluation["actual_ultimate"]
+    evaluation["absolute_ultimate_error"] = evaluation["ultimate_error"].abs()
+
+    actual_ultimate = evaluation["actual_ultimate"].sum()
+    predicted_ultimate = evaluation["predicted_ultimate"].sum()
+    actual_reserve = evaluation["actual_reserve"].sum()
+    predicted_reserve = evaluation["predicted_reserve"].sum()
+    rmse = float(np.sqrt(np.mean(evaluation["ultimate_error"] ** 2)))
+    std = float(evaluation["actual_ultimate"].std(ddof=0))
+    mean = float(evaluation["actual_ultimate"].mean())
+    metrics = {
+        "number_of_claims": len(evaluation),
+        "paid_to_date": float(evaluation["paid_to_date"].sum()),
+        "actual_ultimate": float(actual_ultimate),
+        "predicted_ultimate": float(predicted_ultimate),
+        "actual_reserve": float(actual_reserve),
+        "predicted_reserve": float(predicted_reserve),
+        "ultimate_rmse": rmse,
+        "ultimate_mae": float(evaluation["absolute_ultimate_error"].mean()),
+        "ultimate_bias": float((predicted_ultimate - actual_ultimate) / actual_ultimate),
+        "reserve_bias": float((predicted_reserve - actual_reserve) / actual_reserve),
+        "rmse_to_mean": rmse / mean if mean else np.nan,
+        "rmse_to_std": rmse / std if std else np.nan,
+    }
+    if print_results:
+        print(f"Number of claims: {metrics['number_of_claims']:,}")
+        print(f"Paid to date: {metrics['paid_to_date']:,.2f}")
+        print(f"Actual ultimate: {metrics['actual_ultimate']:,.2f}")
+        print(f"Predicted ultimate: {metrics['predicted_ultimate']:,.2f}")
+        print(f"Actual reserve: {metrics['actual_reserve']:,.2f}")
+        print(f"Predicted reserve: {metrics['predicted_reserve']:,.2f}")
+        print(f"Ultimate bias: {metrics['ultimate_bias']:.2%}")
+        print(f"Reserve bias: {metrics['reserve_bias']:.2%}")
+        print(f"Ultimate RMSE: {metrics['ultimate_rmse']:,.2f}")
+    return evaluation, metrics
