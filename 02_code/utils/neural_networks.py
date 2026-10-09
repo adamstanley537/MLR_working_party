@@ -22,6 +22,7 @@ In addition, a model registry and a function to retrieve model classes by name a
 - get_model_class
 
 """
+import copy
 import pandas as pd
 import numpy as np
 from sklearn.utils.validation import check_is_fitted, check_consistent_length, check_X_y
@@ -81,16 +82,16 @@ writer = SummaryWriter()
 
 class TabularNetRegressor(BaseEstimator, RegressorMixin):
     def __init__(
-        self, 
+        self,
         module,
         #criterion=nn.MSELoss(),
         criterion=nn.PoissonNLLLoss,
-        max_iter=100,   
+        max_iter=100,
         max_lr=0.01,
-        keep_best_model=False,
+        #keep_best_model=False,
         batch_function=None,
         rebatch_every_iter=1,
-        n_hidden=20,    
+        n_hidden=20,
         #n_input=nfeatures,
         #n_output=1,
         l1_penalty=0.0,          # lambda is a reserved word
@@ -101,12 +102,19 @@ class TabularNetRegressor(BaseEstimator, RegressorMixin):
         dropout=0.0,
         clip_value=None,
         n_gaussians=3,
-        verbose=1,                
-        device="cpu", 
+        verbose=1,
+        device="cpu",
         init_bias=None,
         enable_shap=True,  # Enable SHAP explanations
         shap_log_frequency=500,  # Log SHAP every N epochs
-        seed = 42,
+        seed=42,
+        validation_seed=42,
+        early_stopping=True,
+        validation_fraction=0.15,
+        patience=50,
+        min_delta=0.0,
+        min_epochs=0,
+        print_loss_every_iter=100,
         config = None,
         writer = None,
         init_extra=None,
@@ -165,7 +173,7 @@ class TabularNetRegressor(BaseEstimator, RegressorMixin):
         self.criterion = criterion
         self.max_iter = max_iter
         self.max_lr = max_lr
-        self.keep_best_model = keep_best_model
+        #self.keep_best_model = keep_best_model
         self.batch_function = batch_function
         self.rebatch_every_iter = rebatch_every_iter
         self.n_hidden = n_hidden
@@ -179,12 +187,21 @@ class TabularNetRegressor(BaseEstimator, RegressorMixin):
         self.dropout = dropout
         self.clip_value = clip_value
         self.n_gaussians = n_gaussians
+        self.l1_penalty = l1_penalty
+        self.l1_applies_params = l1_applies_params
         self.verbose = verbose
         self.device = device
         self.init_bias = init_bias
         self.enable_shap = enable_shap
         self.shap_log_frequency = shap_log_frequency
         self.seed = seed
+        self.validation_seed = validation_seed
+        self.early_stopping = early_stopping
+        self.validation_fraction = validation_fraction
+        self.patience = patience
+        self.min_delta = min_delta
+        self.min_epochs = min_epochs
+        self.print_loss_every_iter = print_loss_every_iter
         self.config = config
         self.writer = writer
         self.init_extra = init_extra if init_extra is not None else {}
@@ -195,7 +212,7 @@ class TabularNetRegressor(BaseEstimator, RegressorMixin):
         
         # Training state
         self.module_ = None
-        self.best_model = None
+        #self.best_model = None
         self.shap_explainer = None
         self.print_loss_every_iter = kwargs.get('print_loss_every_iter', max(1, int(max_iter / 10)))
 
@@ -250,6 +267,21 @@ class TabularNetRegressor(BaseEstimator, RegressorMixin):
         # Convert to Pytorch Tensor
         X_tensor = torch.from_numpy(self.fix_array(X)).to(self.target_device)
         y_tensor = torch.from_numpy(self.fix_array(y)).to(self.target_device)
+
+        if self.early_stopping:
+            if not 0 < self.validation_fraction < 1:
+                raise ValueError("validation_fraction must be between 0 and 1.")
+            split_rng = np.random.default_rng(self.validation_seed)
+            indices = split_rng.permutation(len(X_tensor))
+            n_val = max(1, int(len(indices) * self.validation_fraction))
+            val_idx, train_idx = indices[:n_val], indices[n_val:]
+            if len(train_idx) == 0:
+                raise ValueError("Validation split leaves no training observations.")
+            X_train, y_train = X_tensor[train_idx], y_tensor[train_idx]
+            X_val, y_val = X_tensor[val_idx], y_tensor[val_idx]
+        else:
+            X_train, y_train = X_tensor, y_tensor
+            X_val = y_val = None
         
         # Optimizer - the generically useful AdamW. Other options like SGD are also possible.
         optimizer = torch.optim.AdamW(
@@ -260,9 +292,9 @@ class TabularNetRegressor(BaseEstimator, RegressorMixin):
         
         # Scheduler - one cycle LR
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer, 
-            max_lr=self.max_lr, 
-            steps_per_epoch=1, 
+            optimizer,
+            max_lr=self.max_lr,
+            steps_per_epoch=1,
             epochs=self.max_iter
         )
         
@@ -277,20 +309,26 @@ class TabularNetRegressor(BaseEstimator, RegressorMixin):
         self.training_rmses_history = []
         self.saved_parameters = {}
         self.testing_epochs = []
-     
-     
+        self.validation_losses_history = []
+        self.validation_rmses_history = []
+        self.learning_rates_history = []
+
         best_loss = float('inf') # set to infinity initially
+        best_rmse = float('inf')
+        best_epoch = -1
+        best_state = None
+        epochs_without_improvement = 0
 
         if self.batch_function is not None:
-            X_tensor_batch, y_tensor_batch = self.batch_function(X_tensor, y_tensor)
+            X_tensor_batch, y_tensor_batch = self.batch_function(X_train, y_train)
         else:
-            X_tensor_batch, y_tensor_batch = X_tensor, y_tensor
+            X_tensor_batch, y_tensor_batch = X_train, y_train
 
         # Initialize SHAP explainer if enabled
         if self.enable_shap and self.shap_explainer is None:
             try:
                 # Create background dataset for SHAP
-                background_data = create_background_dataset(X_tensor, n_samples=100)
+                background_data = create_background_dataset(X_train, n_samples=100)
                 feature_names = self.config['data'].features
                 self.shap_explainer = ShapExplainer(self.module_, background_data, feature_names)
                 if self.verbose > 0:
@@ -317,10 +355,6 @@ class TabularNetRegressor(BaseEstimator, RegressorMixin):
                 )
 
 
-            if self.keep_best_model & (loss.item() < best_loss):
-                best_loss = loss.item()
-                self.best_model = self.module_.state_dict()
-
             optimizer.zero_grad()            #  Reset optimizer            
             loss.backward()                  #  Apply back propagation
 
@@ -333,25 +367,71 @@ class TabularNetRegressor(BaseEstimator, RegressorMixin):
 
             optimizer.step()                 #  Update model parameters
             scheduler.step()
-
             if torch.isnan(loss.data).tolist():
                 raise ValueError('Error: nan loss')
 
+            # Record comparable histories every epoch.
+            self.module_.eval()
+            with torch.no_grad():
+                train_prediction = self.module_(X_train)
+                train_loss = loss_fn(train_prediction, y_train).item()
+                train_rmse = torch.sqrt(torch.mean((train_prediction - y_train) ** 2)).item()
+            self.training_losses_history.append(train_loss)
+            self.training_rmses_history.append(train_rmse)
+            self.learning_rates_history.append(scheduler.get_last_lr()[0])
+
+            if self.early_stopping:
+                with torch.no_grad():
+                    val_prediction = self.module_(X_val)
+                    val_loss = loss_fn(val_prediction, y_val).item()
+                    val_rmse = torch.sqrt(torch.mean((val_prediction - y_val) ** 2)).item()
+                self.validation_losses_history.append(val_loss)
+                self.validation_rmses_history.append(val_rmse)
+
+                # Early stopping is aligned to validation RMSE
+                improved = (
+                    val_rmse
+                    < best_rmse - self.min_delta
+                )
+
+                if improved:
+                    best_rmse = val_rmse
+                    best_loss = val_loss
+                    best_epoch = epoch
+
+                    best_state = copy.deepcopy(
+                        self.module_.state_dict()
+                    )
+
+                    epochs_without_improvement = 0
+
+                elif epoch >= self.min_epochs:
+                    epochs_without_improvement += 1
+
+                else:
+                    # Do not accumulate patience during the minimum training period
+                    epochs_without_improvement = 0
+
+
+                # Only stop when BOTH conditions are satisfied
+                if (
+                    epoch >= self.min_epochs
+                    and epochs_without_improvement >= self.patience
+                ):
+                    if self.verbose > 0:
+                        print(
+                            f"Early stopping at epoch {epoch}. "
+                            f"Best epoch: {best_epoch}. "
+                            f"Best validation RMSE: "
+                            f"{best_rmse:,.2f}."
+                        )
+
+                    break
 
             # Every self.print_loss_every_iter steps, print RMSE 
             if (epoch % self.print_loss_every_iter == 0) and (self.verbose > 0):
                 self.module_.eval()                     # Eval mode 
                 self.module_.point_estimates=True       # Distributional models - set to point 
-
-                #Calculate the training loss on the entire dataset
-                with torch.no_grad():
-                    y_pred_full = self.module_(X_tensor)
-                    full_train_loss = loss_fn(y_pred_full, y_tensor).item()
-                    self.training_losses_history.append(full_train_loss)
-                    
-                    # Calculate the RMSE over the entire dataset
-                    rmse = torch.sqrt(torch.mean(torch.square(y_pred_full - y_tensor)))
-                    self.training_rmses_history.append(rmse.item())
 
                 # Save a deep copy of the model parameters
                 current_state_dict = self.module_.state_dict()
@@ -361,7 +441,10 @@ class TabularNetRegressor(BaseEstimator, RegressorMixin):
                 self.module_.train()                     # back to training
                 self.module_.point_estimates=False       # Distributional models - set to point
                 
-                print(f"Epoch: {epoch} Train RMSE: {rmse.data.tolist()} Train Loss: {full_train_loss}")
+                message = f"Epoch {epoch}: train RMSE={train_rmse:,.2f}, train loss={train_loss:,.2f}, validation RMSE={val_rmse:,.2f}, validation Loss={val_loss:,.2f}"
+                if self.early_stopping:
+                    message += f", validation RMSE={val_rmse:,.2f}"
+                print(message)
 
 
                 # Tensorboard logging
@@ -430,7 +513,7 @@ class TabularNetRegressor(BaseEstimator, RegressorMixin):
                             #sample_indices = np.random.choice(len(X_tensor), sample_size, replace=False)
                             sample_indices = rng.choice(len(X_tensor_batch), sample_size, replace=False)
                             
-                            X_sample = X_tensor[sample_indices]
+                            X_sample = X_train[sample_indices]
                             
                             # Add debug prints before SHAP explanation
                             print(f"Background data shape: {background_data.shape}")
@@ -448,13 +531,21 @@ class TabularNetRegressor(BaseEstimator, RegressorMixin):
 
             if (self.batch_function is not None) & (epoch % self.rebatch_every_iter == 0):
                 print(f"refreshing batch on epoch {epoch}")
-                X_tensor_batch, y_tensor_batch = self.batch_function(X_tensor, y_tensor)
+                X_tensor_batch, y_tensor_batch = self.batch_function(X_train, y_train)
         
-           
+        self.epochs_completed_ = epoch + 1
+        if self.early_stopping and best_state is not None:
+            self.module_.load_state_dict(best_state)
+            self.best_epoch_ = best_epoch
+            self.best_validation_rmse_ = best_rmse
+            self.best_validation_loss_ = best_loss
+        else:
+            self.best_epoch_ = None
+            self.best_validation_rmse_ = None
+            self.best_validation_loss_ = None
 
-        if self.keep_best_model:
-            self.module_.load_state_dict(self.best_model)
-            self.module_.eval()
+
+        self.module_.eval()
             
         return self
 
