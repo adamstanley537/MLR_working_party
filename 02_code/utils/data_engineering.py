@@ -447,3 +447,129 @@ def evaluate_claim_predictions(
         print(f"Reserve bias: {metrics['reserve_bias']:.2%}")
         print(f"Ultimate RMSE: {metrics['ultimate_rmse']:,.2f}")
     return evaluation, metrics
+
+def reserve_bias_by_occurrence_period(
+    prediction_data: pd.DataFrame,
+    predictions,
+    output_column: str,
+    paid_by_claim=None,
+    claim_column: str = "claim_no",
+    occurrence_column: str = "occurrence_period",
+    payment_column: str = "payment_size",
+) -> pd.Series:
+    
+    # One actual ultimate per claim
+    actual_by_claim = (
+        prediction_data
+        .groupby(claim_column)[output_column]
+        .last()
+        .sort_index()
+        .astype(float)
+    )
+
+    # One occurrence period per claim
+    occurrence_by_claim = (
+        prediction_data
+        .groupby(claim_column)[occurrence_column]
+        .first()
+        .reindex(actual_by_claim.index)
+    )
+
+    # Align predictions with sorted claim numbers
+    prediction_array = np.asarray(
+        predictions
+    ).reshape(-1)
+
+    if len(prediction_array) != len(actual_by_claim):
+        raise ValueError(
+            f"Predictions ({len(prediction_array):,}) do not match "
+            f"claims ({len(actual_by_claim):,})."
+        )
+
+    predicted_by_claim = pd.Series(
+        prediction_array,
+        index=actual_by_claim.index,
+        name="predicted_ultimate",
+        dtype=float
+    )
+
+    # Calculate or align paid-to-date
+    if paid_by_claim is None:
+        if "payment_size_cumulative" in prediction_data.columns:
+            paid_by_claim = (
+                prediction_data
+                .sort_values(
+                    [claim_column, "development_period"]
+                )
+                .groupby(claim_column)[
+                    "payment_size_cumulative"
+                ]
+                .last()
+            )
+        else:
+            paid_by_claim = (
+                prediction_data
+                .groupby(claim_column)[payment_column]
+                .sum()
+            )
+    else:
+        paid_by_claim = pd.Series(
+            paid_by_claim,
+            copy=True
+        )
+
+    paid_by_claim = (
+        pd.to_numeric(
+            paid_by_claim,
+            errors="coerce"
+        )
+        .reindex(actual_by_claim.index)
+    )
+
+    if paid_by_claim.isna().any():
+        raise ValueError(
+            "Paid-to-date is missing for one or more claims."
+        )
+
+    # Claim-level values
+    evaluation = pd.DataFrame({
+        occurrence_column: occurrence_by_claim,
+        "actual_ultimate": actual_by_claim,
+        "predicted_ultimate": predicted_by_claim,
+        "paid_to_date": paid_by_claim
+    })
+
+    evaluation["actual_reserve"] = (
+        evaluation["actual_ultimate"]
+        - evaluation["paid_to_date"]
+    )
+
+    evaluation["predicted_reserve"] = (
+        evaluation["predicted_ultimate"]
+        - evaluation["paid_to_date"]
+    )
+
+    # Aggregate reserve amounts by occurrence period
+    grouped_reserves = (
+        evaluation
+        .groupby(occurrence_column)
+        .agg(
+            actual_reserve=("actual_reserve", "sum"),
+            predicted_reserve=("predicted_reserve", "sum")
+        )
+    )
+
+    # Avoid division by zero
+    grouped_reserves["reserve_bias_percentage"] = np.where(
+        grouped_reserves["actual_reserve"] != 0,
+        (
+            grouped_reserves["predicted_reserve"]
+            - grouped_reserves["actual_reserve"]
+        )
+        / grouped_reserves["actual_reserve"],
+        np.nan
+    )
+
+    grouped_reserves["reserve_bias"] = grouped_reserves["predicted_reserve"]- grouped_reserves["actual_reserve"]
+
+    return grouped_reserves[["reserve_bias","reserve_bias_percentage"]]
