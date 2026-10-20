@@ -1078,6 +1078,6 @@ class Make3D(BaseEstimator, TransformerMixin):
         # Convert each group to a tensor
         X_tensors = [torch.tensor(group[self.features].values, dtype=torch.float32) for _, group in grouped]
         # Pad sequences to the same length
-        X_padded = pad_sequence(X_tensors, batch_first=True)
+        X_padded = pad_sequence(X_tensors, batch_first=True, padding_value=0.0, padding_side="left")
         return X_padded
 
